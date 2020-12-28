@@ -1,0 +1,138 @@
+import torchtext
+from torchtext.vocab import Vectors
+import torch
+import numpy as np
+import random
+
+import torch.nn as nn
+
+
+USB_CUDA = torch.cuda.is_available()
+
+random.seed(53113)
+np.random.seed(53113)
+torch.manual_seed(53113)
+if USB_CUDA:
+    torch.cuda.manual_seed(53113)
+
+BATCH_SIZE = 32
+EMBEDDING_SIZE = 100
+MAX_VOCAB_SIZE = 50000
+HIDDEN_SIZE=100
+NUM_EPOCHS = 2 
+LEARNING_RATE = 0.001
+GRAD_CLIP = 5.0
+
+#######################################准备数据集（训练集，目标预测集，测试集）######################################################################
+
+TEXT = torchtext.data.Field(lower = True)	#把所有单词变为小写
+train,val,test=torchtext.datasets.LanguageModelingDataset.splits(path='text8/',train = 'text8.train.txt',validation='text8.dev.txt',test='text8.test.txt',text_field=TEXT)	#torchtext提供了LanguageModelingDataset这个class来帮助我们处理语言模型数据集,得到训练集，label,测试集
+TEXT.build_vocab(train,max_size=MAX_VOCAB_SIZE)
+#print(len(TEXT.vocab))输出50002  50000频数高的单词，<unk>--未知单词，<pad>--太短的字符会用pad补长，整齐便于处理
+#print(TEXT.vocab.stoi['apple'])字典中apple的编码下标
+train_iter, val_iter, test_iter = torchtext.data.BPTTIterator.splits((train, val, test), batch_size=BATCH_SIZE, device=torch.device("cuda" if USB_CUDA else "cpu"), bptt_len=49, repeat=False, shuffle=True)
+#创建可迭代对象。参数一：需处理数据集 参数二：batch的尺寸 参数三：设备（有GPU就用GPU，不然就CPU）参数四：bptt_len LSTM参数传递的长度(一个Tensor的长度) 参数五：训练一遍文件后不会重复 参数六：打乱
+it = iter(train_iter)
+batch = next(it)
+#print(" ".join(TEXT.vocab.itos[i] for i in batch.text[:,1].data.cpu()))打印一下输入数据
+#print(" ".join(TEXT.vocab.itos[i] for i in batch.target[:,1].data.cpu()))打印一下对应的希望输出的数据
+
+################################我是分割线#####################################################################################
+
+#######################################################定义模型####################################################################################
+class RNNModel(nn.Module):
+    """ 一个简单的循环神经网络"""
+
+    def __init__(self, vocab_size, embed_size, hidden_size):  
+        ''' 该模型包含以下几层:
+            - 词嵌入层
+            - 一个循环神经网络层(RNN, LSTM, GRU)
+            - 一个线性层，从hidden state到输出单词表
+            - 一个dropout层，用来做regularization
+        '''
+        super(RNNModel, self).__init__()
+        self.embed = nn.Embedding(vocab_size, embed_size)	#创建一个embeding的层，长=字典长；高=embed_size
+        self.lstm = nn.LSTM(embed_size,hidden_size)
+        self.decoder = nn.Linear(hidden_size, vocab_size)	#解码输出层（[hidden_size,vocab_size]）
+        self.hidden_size = hidden_size
+    def forward(self, text, hidden):
+        '''
+	   Forward pass:
+	    - text:seq_leghth(49那个数)*batch_size
+            - word embedding
+            - 输入循环神经网络
+            - 一个线性层从hidden state转化为输出单词表
+        '''
+        emb = self.embed(text)
+        output,hidden = self.lstm(emb, hidden)	#output--seq_length*batch_size*hidden_size  hidden--(lstm层数*hidden_size,lstm层数*hidden_size)
+        out_vocab = self.decoder(output.view(-1,output.shape[2]))  #三维降为2维才可处理
+        out_vocab = out_vocab.view(output.size(0), output.size(1), out_vocab.size(-1))
+        return out_vocab,hidden
+
+    def init_hidden(self, bsz, requires_grad=True):
+        weight = next(self.parameters())
+        return (weight.new_zeros((1, bsz, self.hidden_size), requires_grad=True),
+                weight.new_zeros((1, bsz, self.hidden_size), requires_grad=True))
+##############################我是分割线###################################################################
+model = RNNModel(vocab_size=len(TEXT.vocab), embed_size=EMBEDDING_SIZE, hidden_size=HIDDEN_SIZE)
+loss_fn = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(model.parameters(),lr=LEARNING_RATE)
+if USB_CUDA:
+    model = model.cuda()
+VOCAB_SIZE = len(TEXT.vocab)
+
+def repackage_hidden(h):	#作用：因为LSTM网络要一直保留之前的‘记忆’，可能会内存溢出。故必须在即将溢出时使用该函数
+    if isinstance(h,torch.Tensor):
+        return h.detach()	#截断计算图，但是保留之前的参数
+    else:
+        return tuple(repackage_hidden(v) for v in h)	#递归，如果h不只一个，那就每个都repackage一下
+val_losses=[]	#通常在EPOCH之前初始化本数组
+scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, 0.5)
+def evaluate(model, data):
+    model.eval()
+    total_loss = 0.
+    it = iter(data)
+    total_count = 0.
+    with torch.no_grad():
+        hidden = model.init_hidden(BATCH_SIZE, requires_grad=False)
+        for i, batch in enumerate(it):
+            data, target = batch.text, batch.target
+            if USB_CUDA:
+                data, target = data.cuda(), target.cuda()
+            hidden = repackage_hidden(hidden)
+            with torch.no_grad():
+                output, hidden = model(data, hidden)
+            loss = loss_fn(output.view(-1, VOCAB_SIZE), target.view(-1))
+            total_count += np.multiply(*data.size())
+            total_loss += loss.item()*np.multiply(*data.size())
+            
+    loss = total_loss / total_count
+    model.train()
+    return loss
+for epoch in range(NUM_EPOCHS):
+    model.train()
+    it = iter(train_iter)
+    hidden = model.init_hidden(BATCH_SIZE)
+    for i, batch in enumerate(it):
+        data,target = batch.text,batch.target 
+        hidden = repackage_hidden(hidden)    #这是经过截断处理的hidden参数
+        output,hidden = model(data,hidden)
+
+        loss = loss_fn(output.view(-1,VOCAB_SIZE),target.view(-1))	#实际的output--seq_length*batch_size*hidden_size 希望的output--seq_size*batch_size*vocab_size==>用view转换
+        optimizer.zero_grad()
+
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(),GRAD_CLIP)	#防止梯度爆炸
+        optimizer.step()
+        if i % 100 ==0:
+            print("loss",loss.item())
+        if i % 1000 == 0:
+            val_loss = evaluate(model, val_iter)
+            if len(val_losses) == 0 or val_loss < min(val_losses):
+#若第一次进入就保存，之后就比较，小于再存
+                print("best model, val loss: ", val_loss)
+                torch.save(model.state_dict(), "lm-best.th")	#把模型参数存下来，在本文件
+            else:
+                scheduler.step()    #loss一直降不下来就调参
+                optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+            val_losses.append(val_loss)
